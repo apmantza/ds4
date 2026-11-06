@@ -42,12 +42,42 @@ __device__ __forceinline__ static uint32_t dev_unpack_iq2_signs(uint32_t v) {
     return s * 0x01010101u;
 }
 
+/*
+ * IQ2_XXS sign expansion without the byte-SIMD emulation of __vcmpne4 / __vsub4
+ * (ds4_rocm.h: about 9 and 7 ALU operations each, twice per 8 weights).
+ *
+ * dev_iq2_negmask() turns a sign byte into a 64-bit mask with 0xff in every
+ * grid byte that is negative: bit k of byte k for the low word, bit 4 + k for
+ * the high word.  After masking, each byte is 0 or a single power of two no
+ * larger than 0x80, so adding 0x7f sets bit 7 exactly for the nonzero bytes
+ * and never carries into the next byte; (y << 1) - (y >> 7) widens 0x80 to
+ * 0xff without a multiply.
+ *
+ * dev_iq2_apply_negmask() produces the same bytes as __vsub4(g ^ m, m), i.e.
+ * g or -g = ~g + 1.  The IQ2_XXS grid bytes are 0x08, 0x19 or 0x2b, so ~g + 1
+ * stays below 0x100 and one 32-bit add of (m & 0x01010101) cannot carry
+ * between bytes.  The signed weights, and therefore every dot product built
+ * from them, are bit-identical to the previous expansion.
+ */
+__device__ __forceinline__ static uint32_t dev_iq2_byte_nonzero_mask(uint32_t t) {
+    const uint32_t y = (t + 0x7f7f7f7fu) & 0x80808080u;
+    return (y << 1) - (y >> 7);
+}
+
+__device__ __forceinline__ static uint64_t dev_iq2_negmask(uint32_t sign) {
+    const uint32_t s = dev_unpack_iq2_signs(sign);
+    return (uint64_t)dev_iq2_byte_nonzero_mask(s & 0x08040201u) |
+           ((uint64_t)dev_iq2_byte_nonzero_mask(s & 0x80402010u) << 32);
+}
+
+__device__ __forceinline__ static int32_t dev_iq2_apply_negmask(uint32_t g, uint32_t m) {
+    return (int32_t)((g ^ m) + (m & 0x01010101u));
+}
+
 __device__ __forceinline__ static int32_t dev_iq2_dp4a_8(uint64_t grid, uint32_t sign, const int8_t *q8, int32_t acc) {
-    const uint32_t signs = dev_unpack_iq2_signs(sign);
-    const int32_t sm0 = __vcmpne4(signs & 0x08040201u, 0);
-    const int32_t sm1 = __vcmpne4(signs & 0x80402010u, 0);
-    const int32_t g0 = __vsub4((int32_t)(uint32_t)grid ^ sm0, sm0);
-    const int32_t g1 = __vsub4((int32_t)(uint32_t)(grid >> 32) ^ sm1, sm1);
+    const uint64_t m = dev_iq2_negmask(sign);
+    const int32_t g0 = dev_iq2_apply_negmask((uint32_t)grid, (uint32_t)m);
+    const int32_t g1 = dev_iq2_apply_negmask((uint32_t)(grid >> 32), (uint32_t)(m >> 32));
     acc = __dp4a(g0, *(const int32_t *)(q8 + 0), acc);
     acc = __dp4a(g1, *(const int32_t *)(q8 + 4), acc);
     return acc;
@@ -70,41 +100,61 @@ __device__ static int32_t dev_dot_iq2_pair_16(uint8_t grid0, uint32_t sign0, uin
     return sum;
 }
 
+/* negmask: 128-entry shared table, negmask[i] = dev_iq2_negmask(cuda_ksigns_iq2xs[i]). */
 template<bool DirectSign = false>
 __device__ __forceinline__ static void dev_iq2_i8x8_lut(
         const uint64_t *grid,
-        const uint8_t *signs,
+        const uint64_t *negmask,
         uint8_t grid_idx,
         uint32_t sign_idx,
         int32_t *w0,
         int32_t *w1) {
-    const uint32_t s = dev_unpack_iq2_signs(DirectSign ? sign_idx : signs[sign_idx]);
-    const int32_t sm0 = __vcmpne4(s & 0x08040201u, 0);
-    const int32_t sm1 = __vcmpne4(s & 0x80402010u, 0);
+    const uint64_t m = DirectSign ? dev_iq2_negmask(sign_idx) : negmask[sign_idx];
     const uint64_t g = grid[grid_idx];
-    *w0 = __vsub4((int32_t)(uint32_t)g ^ sm0, sm0);
-    *w1 = __vsub4((int32_t)(uint32_t)(g >> 32) ^ sm1, sm1);
+    *w0 = dev_iq2_apply_negmask((uint32_t)g, (uint32_t)m);
+    *w1 = dev_iq2_apply_negmask((uint32_t)(g >> 32), (uint32_t)(m >> 32));
 }
 
-__device__ static float dev_dot_iq2_xxs_q8_K_block_lut(
-        const cuda_block_iq2_xxs *x,
+/*
+ * Register-resident IQ2_XXS block for the single-token decode kernels: the
+ * scale and the 32 qs halfwords are loaded with constant indices, so the whole
+ * 66-byte block is in VGPRs before its dot product starts.  Reading it through
+ * a pointer instead interleaves the 2-byte loads with the decode arithmetic,
+ * and on gfx1151 the cache lines of a block are often evicted from L2 before
+ * the lane has used them all (the kernel then fetched about twice the weight
+ * bytes); a by-value block copy whose address is passed on can also land in
+ * scratch.
+ */
+struct dev_iq2_xxs_regs {
+    uint16_t h[33];
+};
+
+__device__ __forceinline__ static dev_iq2_xxs_regs dev_load_iq2_xxs_regs(const cuda_block_iq2_xxs *x) {
+    const uint16_t *p = (const uint16_t *)x;
+    dev_iq2_xxs_regs r;
+    #pragma unroll
+    for (int i = 0; i < 33; i++) r.h[i] = p[i];
+    return r;
+}
+
+__device__ __forceinline__ static float dev_dot_iq2_xxs_q8_K_regs(
+        const dev_iq2_xxs_regs &x,
         const cuda_block_q8_K *y,
         const uint64_t *grid,
-        const uint8_t *signs) {
-    const float xd = dev_f16_to_f32(x->d);
-    const uint16_t *q2 = x->qs;
+        const uint64_t *negmask) {
+    const float xd = dev_f16_to_f32(x.h[0]);
     const int8_t *q8 = y->qs;
     int32_t bsum = 0;
+    #pragma unroll
     for (int ib32 = 0; ib32 < CUDA_QK_K / 32; ib32++) {
-        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
-        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
-        q2 += 4;
+        const uint32_t aux0 = (uint32_t)x.h[1 + 4 * ib32] | ((uint32_t)x.h[2 + 4 * ib32] << 16);
+        const uint32_t aux1 = (uint32_t)x.h[3 + 4 * ib32] | ((uint32_t)x.h[4 + 4 * ib32] << 16);
         const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
         int32_t w[8];
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
+        dev_iq2_i8x8_lut(grid, negmask, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
+        dev_iq2_i8x8_lut(grid, negmask, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
+        dev_iq2_i8x8_lut(grid, negmask, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
+        dev_iq2_i8x8_lut(grid, negmask, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
         int32_t sumi = 0;
         sumi = __dp4a(w[0], *(const int32_t *)(q8 + ib32 * 32u + 0),  sumi);
         sumi = __dp4a(w[1], *(const int32_t *)(q8 + ib32 * 32u + 4),  sumi);
@@ -156,7 +206,7 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
         uint32_t n,
         float acc[8],
         const uint64_t *grid,
-        const uint8_t *signs) {
+        const uint64_t *negmask) {
     const float xd = dev_f16_to_f32(x->d);
     const uint16_t *q2 = x->qs;
     int32_t bsum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -170,10 +220,10 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
         q2 += 4;
         const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
         int32_t w[8];
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
+        dev_iq2_i8x8_lut(grid, negmask, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
+        dev_iq2_i8x8_lut(grid, negmask, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
+        dev_iq2_i8x8_lut(grid, negmask, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
+        dev_iq2_i8x8_lut(grid, negmask, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
         for (uint32_t p = 0; p < n; p++) {
             const int8_t *q = q8[p] + ib32 * 32;
             int32_t sumi = 0;
@@ -201,7 +251,7 @@ __device__ __forceinline__ static void dev_dot_iq2_xxs_q8_K_block4(
         const cuda_block_q8_K *y3,
         float acc[4],
         const uint64_t *grid,
-        const uint8_t *signs) {
+        const uint64_t *negmask) {
     static_assert(N >= 1u && N <= 4u);
     const float xd = dev_f16_to_f32(x->d);
     const uint16_t *q2 = x->qs;
@@ -218,13 +268,13 @@ __device__ __forceinline__ static void dev_dot_iq2_xxs_q8_K_block4(
         q2 += 4;
         const uint32_t ls = 2u * (aux1 >> 28) + 1u;
         int32_t w[8];
-        dev_iq2_i8x8_lut<DirectSign>(grid, signs, (uint8_t)(aux0 & 0xffu),
+        dev_iq2_i8x8_lut<DirectSign>(grid, negmask, (uint8_t)(aux0 & 0xffu),
                          (aux1 >> 0) & 127u, &w[0], &w[1]);
-        dev_iq2_i8x8_lut<DirectSign>(grid, signs, (uint8_t)((aux0 >> 8) & 0xffu),
+        dev_iq2_i8x8_lut<DirectSign>(grid, negmask, (uint8_t)((aux0 >> 8) & 0xffu),
                          (aux1 >> 7) & 127u, &w[2], &w[3]);
-        dev_iq2_i8x8_lut<DirectSign>(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),
+        dev_iq2_i8x8_lut<DirectSign>(grid, negmask, (uint8_t)((aux0 >> 16) & 0xffu),
                          (aux1 >> 14) & 127u, &w[4], &w[5]);
-        dev_iq2_i8x8_lut<DirectSign>(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),
+        dev_iq2_i8x8_lut<DirectSign>(grid, negmask, (uint8_t)((aux0 >> 24) & 0xffu),
                          (aux1 >> 21) & 127u, &w[6], &w[7]);
         #pragma unroll
         for (uint32_t p = 0; p < N; p++) {
@@ -1217,14 +1267,15 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     __shared__ cuda_block_q8_K sxq[16];
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
-    if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
-    }
+    __shared__ uint64_t s_iq2_negmask[128];
+    /* Selected only for xq_blocks <= 16 (use_decode_lut_gate): the activations
+     * are always read from this shared copy, so the compiler emits LDS reads
+     * instead of generic loads through a pointer that could be either. */
+    if (xq_blocks > 16u) __builtin_trap();
+    for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_negmask[i] = dev_iq2_negmask(cuda_ksigns_iq2xs[i]);
     __syncthreads();
-    if (xq_blocks <= 16u) xqb = sxq;
     for (uint32_t rr = 0; rr < 4u; rr++) {
         uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
@@ -1233,8 +1284,10 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
         float gate = 0.0f;
         float up = 0.0f;
         for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-            gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid, s_iq2_signs);
-            up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid, s_iq2_signs);
+            const dev_iq2_xxs_regs gb = dev_load_iq2_xxs_regs(gr + b);
+            const dev_iq2_xxs_regs ub = dev_load_iq2_xxs_regs(ur + b);
+            gate += dev_dot_iq2_xxs_q8_K_regs(gb, sxq + b, s_iq2_grid, s_iq2_negmask);
+            up += dev_dot_iq2_xxs_q8_K_regs(ub, sxq + b, s_iq2_grid, s_iq2_negmask);
         }
         gate = quarter_warp_sum_f32(gate, lane);
         up = quarter_warp_sum_f32(up, lane);
@@ -1252,6 +1305,7 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
             mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
         }
     }
+
 }
 
 __global__ static void moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel(
@@ -1285,14 +1339,15 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel(
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     __shared__ cuda_block_q8_K sxq[16];
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
-    if (xq_blocks <= 16u) {
-        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
-    }
+    __shared__ uint64_t s_iq2_negmask[128];
+    /* Selected only for xq_blocks <= 16 (use_decode_lut_gate): the activations
+     * are always read from this shared copy, so the compiler emits LDS reads
+     * instead of generic loads through a pointer that could be either. */
+    if (xq_blocks > 16u) __builtin_trap();
+    for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_negmask[i] = dev_iq2_negmask(cuda_ksigns_iq2xs[i]);
     __syncthreads();
-    if (xq_blocks <= 16u) xqb = sxq;
     for (uint32_t rr = 0; rr < 4u; rr++) {
         uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
         if (row >= expert_mid_dim) continue;
@@ -1301,8 +1356,10 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel(
         float gate = 0.0f;
         float up = 0.0f;
         for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-            gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid, s_iq2_signs);
-            up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid, s_iq2_signs);
+            const dev_iq2_xxs_regs gb = dev_load_iq2_xxs_regs(gr + b);
+            const dev_iq2_xxs_regs ub = dev_load_iq2_xxs_regs(ur + b);
+            gate += dev_dot_iq2_xxs_q8_K_regs(gb, sxq + b, s_iq2_grid, s_iq2_negmask);
+            up += dev_dot_iq2_xxs_q8_K_regs(ub, sxq + b, s_iq2_grid, s_iq2_negmask);
         }
         gate = quarter_warp_sum_f32(gate, lane);
         up = quarter_warp_sum_f32(up, lane);
@@ -1320,6 +1377,7 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_ptrs_kernel(
             mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
         }
     }
+
 }
 
 __global__ static void moe_count_sorted_pairs_kernel(
@@ -1636,13 +1694,13 @@ __global__ static void moe_gate_up_mid_expert_tile4_row32_kernel(
     uint32_t tile = blockIdx.y;
     if (tile >= *tile_total) return;
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[DirectSign ? 1 : 128];
+    __shared__ uint64_t s_iq2_negmask[DirectSign ? 1 : 128];
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) {
         s_iq2_grid[i] = cuda_iq2xxs_grid[i];
     }
     if constexpr (!DirectSign) {
         for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x)
-            s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+            s_iq2_negmask[i] = dev_iq2_negmask(cuda_ksigns_iq2xs[i]);
     }
     __syncthreads();
     uint32_t lane = threadIdx.x & 7u;
@@ -1675,17 +1733,17 @@ __global__ static void moe_gate_up_mid_expert_tile4_row32_kernel(
         const cuda_block_q8_K *y2 = xqb[2] ? xqb[2] + b : NULL;
         const cuda_block_q8_K *y3 = xqb[3] ? xqb[3] + b : NULL;
         if (np == 1u) {
-            dev_dot_iq2_xxs_q8_K_block4<1u, DirectSign>(gr + b, y0, y1, y2, y3, gate, s_iq2_grid, s_iq2_signs);
-            dev_dot_iq2_xxs_q8_K_block4<1u, DirectSign>(ur + b, y0, y1, y2, y3, up, s_iq2_grid, s_iq2_signs);
+            dev_dot_iq2_xxs_q8_K_block4<1u, DirectSign>(gr + b, y0, y1, y2, y3, gate, s_iq2_grid, s_iq2_negmask);
+            dev_dot_iq2_xxs_q8_K_block4<1u, DirectSign>(ur + b, y0, y1, y2, y3, up, s_iq2_grid, s_iq2_negmask);
         } else if (np == 2u) {
-            dev_dot_iq2_xxs_q8_K_block4<2u, DirectSign>(gr + b, y0, y1, y2, y3, gate, s_iq2_grid, s_iq2_signs);
-            dev_dot_iq2_xxs_q8_K_block4<2u, DirectSign>(ur + b, y0, y1, y2, y3, up, s_iq2_grid, s_iq2_signs);
+            dev_dot_iq2_xxs_q8_K_block4<2u, DirectSign>(gr + b, y0, y1, y2, y3, gate, s_iq2_grid, s_iq2_negmask);
+            dev_dot_iq2_xxs_q8_K_block4<2u, DirectSign>(ur + b, y0, y1, y2, y3, up, s_iq2_grid, s_iq2_negmask);
         } else if (np == 3u) {
-            dev_dot_iq2_xxs_q8_K_block4<3u, DirectSign>(gr + b, y0, y1, y2, y3, gate, s_iq2_grid, s_iq2_signs);
-            dev_dot_iq2_xxs_q8_K_block4<3u, DirectSign>(ur + b, y0, y1, y2, y3, up, s_iq2_grid, s_iq2_signs);
+            dev_dot_iq2_xxs_q8_K_block4<3u, DirectSign>(gr + b, y0, y1, y2, y3, gate, s_iq2_grid, s_iq2_negmask);
+            dev_dot_iq2_xxs_q8_K_block4<3u, DirectSign>(ur + b, y0, y1, y2, y3, up, s_iq2_grid, s_iq2_negmask);
         } else {
-            dev_dot_iq2_xxs_q8_K_block4<4u, DirectSign>(gr + b, y0, y1, y2, y3, gate, s_iq2_grid, s_iq2_signs);
-            dev_dot_iq2_xxs_q8_K_block4<4u, DirectSign>(ur + b, y0, y1, y2, y3, up, s_iq2_grid, s_iq2_signs);
+            dev_dot_iq2_xxs_q8_K_block4<4u, DirectSign>(gr + b, y0, y1, y2, y3, gate, s_iq2_grid, s_iq2_negmask);
+            dev_dot_iq2_xxs_q8_K_block4<4u, DirectSign>(ur + b, y0, y1, y2, y3, up, s_iq2_grid, s_iq2_negmask);
         }
     }
     for (uint32_t p = 0; p < np; p++) {
@@ -1717,7 +1775,7 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block4_deq_lut(
         uint32_t n,
         float acc[4],
         const uint64_t *grid,
-        const uint8_t *signs) {
+        const uint64_t *negmask) {
     const float xd = dev_f16_to_f32(x->d);
     const uint16_t *q2 = x->qs;
     int32_t bsum[4] = {0, 0, 0, 0};
@@ -1730,10 +1788,10 @@ __device__ static void dev_dot_iq2_xxs_q8_K_block4_deq_lut(
         q2 += 4;
         const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
         int32_t w[8];
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
-        dev_iq2_i8x8_lut(grid, signs, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
+        dev_iq2_i8x8_lut(grid, negmask, (uint8_t)(aux0 & 0xffu),           (aux1 >> 0)  & 127u, &w[0], &w[1]);
+        dev_iq2_i8x8_lut(grid, negmask, (uint8_t)((aux0 >> 8)  & 0xffu),   (aux1 >> 7)  & 127u, &w[2], &w[3]);
+        dev_iq2_i8x8_lut(grid, negmask, (uint8_t)((aux0 >> 16) & 0xffu),   (aux1 >> 14) & 127u, &w[4], &w[5]);
+        dev_iq2_i8x8_lut(grid, negmask, (uint8_t)((aux0 >> 24) & 0xffu),   (aux1 >> 21) & 127u, &w[6], &w[7]);
         for (uint32_t p = 0; p < n; p++) {
             const int8_t *q = q8[p] + ib32 * 32;
             int32_t sumi = 0;
@@ -1786,9 +1844,9 @@ __global__ static void glm53_rocm_iq2_gate_up_verify_kernel(
     if (max_count != 0u && count >= max_count) return;
     uint32_t local_start = tile_starts[tile];
     __shared__ uint64_t grids[256];
-    __shared__ uint8_t signs[128];
+    __shared__ uint64_t s_deq_negmask[128];
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) grids[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) signs[i] = cuda_ksigns_iq2xs[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_deq_negmask[i] = dev_iq2_negmask(cuda_ksigns_iq2xs[i]);
     __syncthreads();
     uint32_t pair[4] = {0, 0, 0, 0};
     uint32_t tok[4] = {0, 0, 0, 0};
@@ -1811,9 +1869,9 @@ __global__ static void glm53_rocm_iq2_gate_up_verify_kernel(
 #pragma unroll 1
     for (uint32_t b = lane; b < xq_blocks; b += 8u) {
         dev_dot_iq2_xxs_q8_K_block4_deq_lut(gr + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                    xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL, np, gate, grids, signs);
+                                    xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL, np, gate, grids, s_deq_negmask);
         dev_dot_iq2_xxs_q8_K_block4_deq_lut(ur + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
-                                    xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL, np, up, grids, signs);
+                                    xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL, np, up, grids, s_deq_negmask);
     }
     for (uint32_t p = 0; p < np; p++) {
         gate[p] = quarter_warp_sum_f32(gate[p], lane);
@@ -1867,7 +1925,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
     uint32_t local_start = tile_starts[tile];
     __shared__ cuda_block_q8_K sxq[8][16];
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
+    __shared__ uint64_t s_iq2_negmask[128];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -1889,7 +1947,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
         }
     }
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_negmask[i] = dev_iq2_negmask(cuda_ksigns_iq2xs[i]);
     __syncthreads();
     if (xq_blocks <= 16u) {
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
@@ -1904,12 +1962,12 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
                                             xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                             xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                             xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate,
-                                            s_iq2_grid, s_iq2_signs);
+                                            s_iq2_grid, s_iq2_negmask);
         dev_dot_iq2_xxs_q8_K_block8_deq_lut(ur + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
                                             xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                             xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                             xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up,
-                                            s_iq2_grid, s_iq2_signs);
+                                            s_iq2_grid, s_iq2_negmask);
     }
     for (uint32_t p = 0; p < np; p++) {
         gate[p] = quarter_warp_sum_f32(gate[p], lane);
@@ -1962,7 +2020,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
     uint32_t local_start = tile_starts[tile];
     __shared__ cuda_block_q8_K sxq[8][16];
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
+    __shared__ uint64_t s_iq2_negmask[128];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -1984,7 +2042,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
         }
     }
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_negmask[i] = dev_iq2_negmask(cuda_ksigns_iq2xs[i]);
     __syncthreads();
     if (xq_blocks <= 16u) {
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
@@ -2001,12 +2059,12 @@ __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
                                                 xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                                 xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                                 xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate,
-                                                s_iq2_grid, s_iq2_signs);
+                                                s_iq2_grid, s_iq2_negmask);
             dev_dot_iq2_xxs_q8_K_block8_deq_lut(ur + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
                                                 xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                                 xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                                 xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up,
-                                                s_iq2_grid, s_iq2_signs);
+                                                s_iq2_grid, s_iq2_negmask);
         }
         for (uint32_t p = 0; p < np; p++) {
             gate[p] = quarter_warp_sum_f32(gate[p], lane);
@@ -2061,7 +2119,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
     uint32_t local_start = tile_starts[tile];
     __shared__ cuda_block_q8_K sxq[8][16];
     __shared__ uint64_t s_iq2_grid[256];
-    __shared__ uint8_t s_iq2_signs[128];
+    __shared__ uint64_t s_iq2_negmask[128];
     uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -2083,7 +2141,7 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
         }
     }
     for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_negmask[i] = dev_iq2_negmask(cuda_ksigns_iq2xs[i]);
     __syncthreads();
     if (xq_blocks <= 16u) {
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
@@ -2100,12 +2158,12 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
                                                 xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                                 xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                                 xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, gate,
-                                                s_iq2_grid, s_iq2_signs);
+                                                s_iq2_grid, s_iq2_negmask);
             dev_dot_iq2_xxs_q8_K_block8_deq_lut(ur + b, xqb[0] ? xqb[0] + b : NULL, xqb[1] ? xqb[1] + b : NULL,
                                                 xqb[2] ? xqb[2] + b : NULL, xqb[3] ? xqb[3] + b : NULL,
                                                 xqb[4] ? xqb[4] + b : NULL, xqb[5] ? xqb[5] + b : NULL,
                                                 xqb[6] ? xqb[6] + b : NULL, xqb[7] ? xqb[7] + b : NULL, np, up,
-                                                s_iq2_grid, s_iq2_signs);
+                                                s_iq2_grid, s_iq2_negmask);
         }
         for (uint32_t p = 0; p < np; p++) {
             gate[p] = quarter_warp_sum_f32(gate[p], lane);
